@@ -34,8 +34,6 @@ try:
         mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
         mongo_client.admin.command("ping")
         db = mongo_client[MONGODB_DB]
-        db.settings.create_index("_id", unique=True)
-        db.stats.create_index("_id", unique=True)
         mongo_ready = True
         log.info("MongoDB connected; database=%s", MONGODB_DB)
     else:
