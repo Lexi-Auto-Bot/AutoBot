@@ -165,8 +165,11 @@ def render_text(value, user=None, chat=None):
     name = " ".join(x for x in (user.get("first_name", ""), user.get("last_name", "")) if x).strip() or "there"
     mention = f'<a href="tg://user?id={int(user.get("id", 0))}">{html.escape(name)}</a>'
     chat_name = html.escape(str(chat.get("title") or chat.get("username") or "this chat"))
-    return (str(value or "").replace("{mention}", mention)
-            .replace("{chat}", chat_name).replace("{bot_mention}", bot_mention()))
+    rendered = str(value or "").replace("{mention}", mention).replace("{chat}", chat_name)
+    # Avoid an unnecessary Telegram getMe network request on every /start.
+    if "{bot_mention}" in rendered:
+        rendered = rendered.replace("{bot_mention}", bot_mention())
+    return rendered
 
 
 def save_message(kind, message):
@@ -274,13 +277,11 @@ def handle_message(message):
     chat_id = int(chat.get("id") or 0)
     if chat.get("type") != "private" or not uid:
         return
-    remember_user_id(uid)
     text = str(message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
 
     if command == "/start":
-        if is_admin(uid):
-            send_owner_action(chat_id, "typing")
+        # Send the welcome before optional owner status and database writes.
         saved = db.settings.find_one({"_id": "start_message"}) if mongo_ready else None
         if saved:
             send_saved(saved, chat_id, user)
@@ -296,8 +297,12 @@ def handle_message(message):
             )
             tg("sendMessage", {"chat_id": chat_id, "text": welcome, "parse_mode": "HTML"})
         inc("starts")
+        remember_user_id(uid)
+        if is_admin(uid):
+            send_owner_action(chat_id, "typing")
         return
 
+    remember_user_id(uid)
     if not is_admin(uid):
         return
 
