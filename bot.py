@@ -139,6 +139,17 @@ def remember_user_id(user_id):
         log.exception("Could not save user ID")
 
 
+def ui_card(title, body, icon="✦"):
+    """Consistent AutoBot dark-neon-inspired Telegram message layout."""
+    return (
+        f"{icon} <b>AUTOBOT  /  {title.upper()}</b>\n"
+        "<i>━━━━━━━━━━━━━━━━━━━━</i>\n\n"
+        f"{body}\n\n"
+        "<i>━━━━━━━━━━━━━━━━━━━━</i>\n"
+        "<i>⚡ Smart • Fast • Reliable</i>"
+    )
+
+
 def bot_mention():
     result = tg("getMe", timeout=8)
     if result.get("ok"):
@@ -274,10 +285,15 @@ def handle_message(message):
         if saved:
             send_saved(saved, chat_id, user)
         else:
-            welcome = ("✦ <b>WELCOME TO JOIN BOT</b> ✦\n\n"
-                       f"Hello {render_text('{mention}', user)},\n\n"
-                       f"I automatically approve channel join requests. Add me as an admin "
-                       "and grant permission to invite users.")
+            welcome = ui_card(
+                "Welcome",
+                f"Hey {render_text('{mention}', user)} 👋\n\n"
+                "I automatically approve channel join requests.\n\n"
+                "➜ Add me as a channel admin\n"
+                "➜ Grant permission to invite users\n"
+                "➜ I'll handle incoming join requests for you.",
+                "🤖",
+            )
             tg("sendMessage", {"chat_id": chat_id, "text": welcome, "parse_mode": "HTML"})
         inc("starts")
         return
@@ -291,7 +307,11 @@ def handle_message(message):
         pending_setup.pop(uid, None)
         tg("sendMessage", {
             "chat_id": chat_id,
-            "text": "✦ <b>Broadcast mode</b>\n\n<i>Ab apna message, photo, video, GIF, document ya buttons wala message bhejiye. Main usi original message ko copy karke sabhi saved users ko bhejunga.</i>\n\n<i>Cancel karne ke liye /cancel bhejein.</i>",
+            "text": ui_card(
+                "Broadcast Studio",
+                "📡 <b>Ready to broadcast</b>\n\nSend your text, photo, video, GIF, document or a message with buttons. I'll copy the original message to saved users.\n\n🛑 Send /cancel anytime to stop setup.",
+                "📣",
+            ),
             "parse_mode": "HTML",
         })
         return
@@ -302,17 +322,18 @@ def handle_message(message):
         pending_broadcast.discard(uid)
         tg("sendMessage", {
             "chat_id": chat_id,
-            "text": "Broadcast cancelled." if was_broadcast else "Cancelled. No changes were made.",
+            "text": ui_card("Cancelled", "Broadcast cancelled." if was_broadcast else "Setup cancelled. No changes were made.", "🛑"),
+            "parse_mode": "HTML",
         })
         return
 
     if uid in pending_broadcast:
         if command:
-            tg("sendMessage", {"chat_id": chat_id, "text": "Please send the message to broadcast, or /cancel."})
+            tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Waiting for message", "Send the message you want to broadcast, or /cancel.", "⏳"), "parse_mode": "HTML"})
             return
         pending_broadcast.discard(uid)
         send_owner_action(chat_id, action_for_message(message))
-        tg("sendMessage", {"chat_id": chat_id, "text": "Broadcast started. This may take a little time."})
+        tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Broadcast Started", "Your message is being delivered to saved users. This may take a little time.", "🚀"), "parse_mode": "HTML"})
         sent, failed = broadcast_message(
             chat_id,
             int(message.get("message_id") or 0),
@@ -321,7 +342,7 @@ def handle_message(message):
         tg("sendMessage", {
             "chat_id": chat_id,
             "parse_mode": "HTML",
-            "text": f"✦ <b>Broadcast finished</b>\n\n<i>Delivered:</i> <b>{sent}</b>\n<i>Failed:</i> <b>{failed}</b>",
+            "text": ui_card("Broadcast Report", f"🟢 <b>Delivered:</b> {sent:,}\n🔴 <b>Failed:</b> {failed:,}\n\n📊 <b>Attempted:</b> {sent + failed:,}", "📣"),
         })
         return
 
@@ -329,7 +350,7 @@ def handle_message(message):
         send_owner_action(chat_id, "typing")
         pending_setup[uid] = "start" if command == "/setstart" else "join"
         label = "start message" if command == "/setstart" else "join message"
-        tg("sendMessage", {"chat_id": chat_id, "text": f"Send the {label} now. Text or media is supported. /cancel to stop."})
+        tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Message Setup", f"📝 Send your {label} now.\n\nText and supported media are accepted.\nUse /cancel to leave without saving.", "⚙️"), "parse_mode": "HTML"})
         return
 
     if command == "/default":
@@ -337,7 +358,7 @@ def handle_message(message):
         if mongo_ready:
             db.settings.delete_one({"_id": "start_message"})
         pending_setup.pop(uid, None)
-        tg("sendMessage", {"chat_id": chat_id, "text": "Default /start message restored."})
+        tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Welcome Reset", "The built-in /start message has been restored.", "🔄"), "parse_mode": "HTML"})
         return
 
     if command == "/empty":
@@ -345,7 +366,7 @@ def handle_message(message):
         if mongo_ready:
             db.settings.delete_one({"_id": "join_message"})
         pending_setup.pop(uid, None)
-        tg("sendMessage", {"chat_id": chat_id, "text": "Saved join message disabled."})
+        tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Join Message Disabled", "The saved post after join approval is now disabled.", "🧹"), "parse_mode": "HTML"})
         return
 
     if command == "/stats":
@@ -359,21 +380,22 @@ def handle_message(message):
         tg("sendMessage", {
             "chat_id": chat_id,
             "parse_mode": "HTML",
-            "text": (
-                "✦ <b>JOINBOT · STATISTICS</b> ✦\n"
-                "<i>━━━━━━━━━━━━━━━━━━</i>\n\n"
-                "<i>System overview</i>\n"
-                f"🗄️ <i>Database:</i> <b>{'🟢 Connected' if mongo_ready else '🔴 Offline'}</b>\n"
-                f"👥 <i>Saved user IDs:</i> <b>{users_count:,}</b>\n"
-                f"⏱ <i>Uptime:</i> <b>{days}d {hours}h {minutes}m</b>\n\n"
-                "<i>Join requests</i>\n"
-                f"📥 <i>Total requests:</i> <b>{(stats or {}).get('requests', 0):,}</b>\n"
-                f"✅ <i>Approved:</i> <b>{(stats or {}).get('approved', 0):,}</b>\n"
-                f"⚠️ <i>Failed:</i> <b>{(stats or {}).get('failed', 0):,}</b>\n\n"
-                "<i>Bot activity</i>\n"
-                f"✉️ <i>Starts:</i> <b>{(stats or {}).get('starts', 0):,}</b>\n"
-                f"📢 <i>Broadcasts:</i> <b>{(stats or {}).get('broadcasts', 0):,}</b>\n"
-                "<i>━━━━━━━━━━━━━━━━━━</i>"
+            "text": ui_card(
+                "Live Analytics",
+                "🧩 <b>SYSTEM</b>\n"
+                f"🗄️ Database: <b>{'🟢 Connected' if mongo_ready else '🔴 Offline'}</b>\n"
+                f"👥 Saved users: <b>{users_count:,}</b>\n"
+                f"⏱ Uptime: <b>{days}d {hours}h {minutes}m</b>\n\n"
+                "📨 <b>JOIN REQUESTS</b>\n"
+                f"📥 Received: <b>{(stats or {}).get('requests', 0):,}</b>\n"
+                f"✅ Approved: <b>{(stats or {}).get('approved', 0):,}</b>\n"
+                f"⚠️ Failed: <b>{(stats or {}).get('failed', 0):,}</b>\n\n"
+                "⚡ <b>BOT ACTIVITY</b>\n"
+                f"✉️ Starts: <b>{(stats or {}).get('starts', 0):,}</b>\n"
+                f"📣 Broadcasts: <b>{(stats or {}).get('broadcasts', 0):,}</b>\n"
+                f"📤 Delivered: <b>{(stats or {}).get('broadcast_delivered', 0):,}</b>\n"
+                f"📭 Failed deliveries: <b>{(stats or {}).get('broadcast_failed', 0):,}</b>",
+                "📊",
             ),
         })
         return
@@ -382,13 +404,13 @@ def handle_message(message):
         send_owner_action(chat_id, action_for_message(message))
         kind = next((k for k in MEDIA_FIELDS if message.get(k)), "text" if message.get("text") is not None else None)
         if not kind:
-            tg("sendMessage", {"chat_id": chat_id, "text": "Please send text or supported media, or /cancel."})
+            tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Unsupported Message", "Please send text or supported media, or /cancel.", "⚠️"), "parse_mode": "HTML"})
             return
         if save_message(kind, message):
             pending_setup.pop(uid, None)
-            tg("sendMessage", {"chat_id": chat_id, "text": "Saved successfully in MongoDB."})
+            tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Saved Successfully", "Your message has been saved in the database.", "✅"), "parse_mode": "HTML"})
         else:
-            tg("sendMessage", {"chat_id": chat_id, "text": "Could not save; check MongoDB connection."})
+            tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Save Failed", "The message could not be saved. Check the database connection and try again.", "⚠️"), "parse_mode": "HTML"})
 
 
 def handle_join(update):
