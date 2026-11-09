@@ -316,11 +316,15 @@ def handle_message(message):
     chat_id = int(chat.get("id") or 0)
     if chat.get("type") != "private" or not uid:
         return
-    # Show the matching native Telegram status immediately when an update arrives.
-    # Telegram clears it as soon as the bot sends its reply (otherwise it expires in ~5s).
-    start_chat_action(chat_id, action_for_message(message))
     text = str(message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+    # Start a status only for updates this bot will handle; keep it refreshed
+    # until Telegram accepts the corresponding reply.
+    admin_commands = {"/broadcast", "/cancel", "/setstart", "/joinmessage", "/default", "/empty", "/stats"}
+    if command == "/start" or (is_admin(uid) and (
+        command in admin_commands or uid in pending_setup or uid in pending_broadcast
+    )):
+        start_chat_action(chat_id, action_for_message(message))
 
     if command == "/start":
         # Send the welcome before optional owner status and database writes.
