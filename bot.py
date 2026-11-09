@@ -100,8 +100,10 @@ def action_for_message(message):
         return "upload_video"
     if message.get("document"):
         return "upload_document"
-    if message.get("voice") or message.get("audio"):
+    if message.get("voice"):
         return "upload_voice"
+    if message.get("audio"):
+        return "upload_document"
     if message.get("video_note"):
         return "upload_video_note"
     if message.get("sticker"):
@@ -266,6 +268,8 @@ def handle_message(message):
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
 
     if command == "/start":
+        if is_admin(uid):
+            send_owner_action(chat_id, "typing")
         saved = db.settings.find_one({"_id": "start_message"}) if mongo_ready else None
         if saved:
             send_saved(saved, chat_id, user)
