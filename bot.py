@@ -277,6 +277,9 @@ def handle_message(message):
     chat_id = int(chat.get("id") or 0)
     if chat.get("type") != "private" or not uid:
         return
+    # Show the matching native Telegram status immediately when an update arrives.
+    # Telegram clears it as soon as the bot sends its reply (otherwise it expires in ~5s).
+    send_owner_action(chat_id, action_for_message(message))
     text = str(message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
 
@@ -298,8 +301,6 @@ def handle_message(message):
             tg("sendMessage", {"chat_id": chat_id, "text": welcome, "parse_mode": "HTML"})
         inc("starts")
         remember_user_id(uid)
-        if is_admin(uid):
-            send_owner_action(chat_id, "typing")
         return
 
     remember_user_id(uid)
@@ -307,7 +308,6 @@ def handle_message(message):
         return
 
     if command == "/broadcast":
-        send_owner_action(chat_id, "typing")
         pending_broadcast.add(uid)
         pending_setup.pop(uid, None)
         tg("sendMessage", {
@@ -337,7 +337,6 @@ def handle_message(message):
             tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Waiting for message", "Send the message you want to broadcast, or /cancel.", "⏳"), "parse_mode": "HTML"})
             return
         pending_broadcast.discard(uid)
-        send_owner_action(chat_id, action_for_message(message))
         tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Broadcast Started", "Your message is being delivered to saved users. This may take a little time.", "🚀"), "parse_mode": "HTML"})
         sent, failed = broadcast_message(
             chat_id,
@@ -438,6 +437,7 @@ def handle_join(update):
     saved = db.settings.find_one({"_id": "join_message"}) if mongo_ready else None
     user_chat_id = int(join.get("user_chat_id") or 0)
     if saved and user_chat_id:
+        send_owner_action(user_chat_id, "typing")
         send_saved(saved, user_chat_id, user, chat)
 
 
