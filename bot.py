@@ -351,14 +351,12 @@ def handle_message(message):
         return
 
     if command in ("/setstart", "/joinmessage"):
-        send_owner_action(chat_id, "typing")
         pending_setup[uid] = "start" if command == "/setstart" else "join"
         label = "start message" if command == "/setstart" else "join message"
         tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Message Setup", f"📝 Send your {label} now.\n\nText and supported media are accepted.\nUse /cancel to leave without saving.", "⚙️"), "parse_mode": "HTML"})
         return
 
     if command == "/default":
-        send_owner_action(chat_id, "typing")
         if mongo_ready:
             db.settings.delete_one({"_id": "start_message"})
         pending_setup.pop(uid, None)
@@ -366,7 +364,6 @@ def handle_message(message):
         return
 
     if command == "/empty":
-        send_owner_action(chat_id, "typing")
         if mongo_ready:
             db.settings.delete_one({"_id": "join_message"})
         pending_setup.pop(uid, None)
@@ -374,7 +371,6 @@ def handle_message(message):
         return
 
     if command == "/stats":
-        send_owner_action(chat_id, "typing")
         stats = db.stats.find_one({"_id": "global"}) if mongo_ready else {}
         users_count = db.users.count_documents({}) if mongo_ready else 0
         uptime = max(0, int(time.time() - started_at))
@@ -405,7 +401,6 @@ def handle_message(message):
         return
 
     if uid in pending_setup:
-        send_owner_action(chat_id, action_for_message(message))
         kind = next((k for k in MEDIA_FIELDS if message.get(k)), "text" if message.get("text") is not None else None)
         if not kind:
             tg("sendMessage", {"chat_id": chat_id, "text": ui_card("Unsupported Message", "Please send text or supported media, or /cancel.", "⚠️"), "parse_mode": "HTML"})
