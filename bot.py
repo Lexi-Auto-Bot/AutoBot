@@ -79,6 +79,36 @@ def tg(method, payload=None, timeout=30):
         return {"ok": False, "description": "Telegram API request failed"}
 
 
+
+def send_owner_action(owner_chat_id, action="typing"):
+    """Show Telegram's native bot status in the owner's private chat."""
+    allowed = {
+        "typing", "upload_photo", "record_video", "upload_video",
+        "record_voice", "upload_voice", "upload_document", "choose_sticker",
+        "find_location", "record_video_note", "upload_video_note", "watch_video",
+    }
+    if action not in allowed:
+        action = "typing"
+    return tg("sendChatAction", {"chat_id": int(owner_chat_id), "action": action}, timeout=8)
+
+
+def action_for_message(message):
+    """Choose a native Telegram chat action matching the incoming content type."""
+    if message.get("photo"):
+        return "upload_photo"
+    if message.get("video") or message.get("animation"):
+        return "upload_video"
+    if message.get("document"):
+        return "upload_document"
+    if message.get("voice") or message.get("audio"):
+        return "upload_voice"
+    if message.get("video_note"):
+        return "upload_video_note"
+    if message.get("sticker"):
+        return "choose_sticker"
+    return "typing"
+
+
 def inc(field, amount=1):
     if mongo_ready:
         try:
@@ -252,6 +282,7 @@ def handle_message(message):
         return
 
     if command == "/broadcast":
+        send_owner_action(chat_id, "typing")
         pending_broadcast.add(uid)
         pending_setup.pop(uid, None)
         tg("sendMessage", {
@@ -276,6 +307,7 @@ def handle_message(message):
             tg("sendMessage", {"chat_id": chat_id, "text": "Please send the message to broadcast, or /cancel."})
             return
         pending_broadcast.discard(uid)
+        send_owner_action(chat_id, action_for_message(message))
         tg("sendMessage", {"chat_id": chat_id, "text": "Broadcast started. This may take a little time."})
         sent, failed = broadcast_message(
             chat_id,
@@ -290,12 +322,14 @@ def handle_message(message):
         return
 
     if command in ("/setstart", "/joinmessage"):
+        send_owner_action(chat_id, "typing")
         pending_setup[uid] = "start" if command == "/setstart" else "join"
         label = "start message" if command == "/setstart" else "join message"
         tg("sendMessage", {"chat_id": chat_id, "text": f"Send the {label} now. Text or media is supported. /cancel to stop."})
         return
 
     if command == "/default":
+        send_owner_action(chat_id, "typing")
         if mongo_ready:
             db.settings.delete_one({"_id": "start_message"})
         pending_setup.pop(uid, None)
@@ -303,6 +337,7 @@ def handle_message(message):
         return
 
     if command == "/empty":
+        send_owner_action(chat_id, "typing")
         if mongo_ready:
             db.settings.delete_one({"_id": "join_message"})
         pending_setup.pop(uid, None)
@@ -310,6 +345,7 @@ def handle_message(message):
         return
 
     if command == "/stats":
+        send_owner_action(chat_id, "typing")
         stats = db.stats.find_one({"_id": "global"}) if mongo_ready else {}
         users_count = db.users.count_documents({}) if mongo_ready else 0
         uptime = max(0, int(time.time() - started_at))
@@ -339,6 +375,7 @@ def handle_message(message):
         return
 
     if uid in pending_setup:
+        send_owner_action(chat_id, action_for_message(message))
         kind = next((k for k in MEDIA_FIELDS if message.get(k)), "text" if message.get("text") is not None else None)
         if not kind:
             tg("sendMessage", {"chat_id": chat_id, "text": "Please send text or supported media, or /cancel."})
