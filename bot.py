@@ -1,13 +1,14 @@
 import os
 import time
 import uuid
+import hashlib
+import hmac
 import logging
-import threading
 from datetime import datetime, timedelta
 
 import requests
-from flask import Flask, jsonify
-from pymongo import MongoClient, ReturnDocument
+from flask import Flask, jsonify, request
+from pymongo import MongoClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("joinbot")
@@ -15,6 +16,7 @@ log = logging.getLogger("joinbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "joinbot").strip() or "joinbot"
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 ADMIN_IDS = set()
 for key in ("ADMIN_IDS", "ADMIN_IDS_2", "ADMIN_IDS_3", "ADMIN_ID"):
     for value in os.getenv(key, "").replace(";", ",").split(","):
@@ -34,19 +36,19 @@ try:
         mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
         mongo_client.admin.command("ping")
         db = mongo_client[MONGODB_DB]
+        # Only the Telegram user ID (_id) and the retention timestamp are stored.
+        # MongoDB's TTL monitor expires records after 365 days; no app cleanup loop.
+        db.users.create_index("created_at", expireAfterSeconds=365 * 24 * 60 * 60, name="user_id_retention_365d")
         mongo_ready = True
         log.info("MongoDB connected; database=%s", MONGODB_DB)
     else:
         log.error("MONGODB_URI is missing")
 except Exception:
-    log.exception("MongoDB connection failed")
+    log.exception("MongoDB connection/index setup failed")
 
 started_at = time.time()
-offset = 0
-pending = {}
-poller_owner = f"{os.getenv('RENDER_INSTANCE_ID', 'local')}:{uuid.uuid4().hex}"
-poller_started = False
-poller_lock = threading.Lock()
+pending_setup = {}
+pending_broadcast = set()
 MEDIA_FIELDS = ("photo", "video", "document", "animation", "audio", "voice", "video_note", "sticker")
 SEND_METHODS = {
     "photo": ("sendPhoto", "photo"),
@@ -58,8 +60,11 @@ SEND_METHODS = {
     "video_note": ("sendVideoNote", "video_note"),
     "sticker": ("sendSticker", "sticker"),
 }
+WEBHOOK_PATH = hashlib.sha256(("joinbot-webhook:" + BOT_TOKEN).encode()).hexdigest()[:40] if BOT_TOKEN else "not-configured"
+WEBHOOK_SECRET = hashlib.sha256(("joinbot-secret:" + BOT_TOKEN).encode()).hexdigest() if BOT_TOKEN else ""
 
-def tg(method, payload=None, timeout=35):
+
+def tg(method, payload=None, timeout=30):
     if not BOT_TOKEN:
         return {"ok": False, "description": "BOT_TOKEN is not configured"}
     try:
@@ -73,16 +78,34 @@ def tg(method, payload=None, timeout=35):
         log.exception("Telegram API call failed: %s", method)
         return {"ok": False, "description": "Telegram API request failed"}
 
-def inc(field):
+
+def inc(field, amount=1):
     if mongo_ready:
         try:
             db.stats.update_one(
                 {"_id": "global"},
-                {"$inc": {field: 1}, "$set": {"updated_at": datetime.utcnow()}},
+                {"$inc": {field: amount}, "$set": {"updated_at": datetime.utcnow()}},
                 upsert=True,
             )
         except Exception:
             log.exception("Stats update failed")
+
+
+def remember_user_id(user_id):
+    """Store no profile fields: only _id=user ID plus created_at for 365-day TTL."""
+    if not mongo_ready or not user_id:
+        return
+    now = datetime.utcnow()
+    try:
+        db.users.delete_one({"_id": int(user_id), "created_at": {"$lte": now - timedelta(days=365)}})
+        db.users.update_one(
+            {"_id": int(user_id)},
+            {"$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+    except Exception:
+        log.exception("Could not save user ID")
+
 
 def bot_mention():
     result = tg("getMe", timeout=8)
@@ -90,6 +113,7 @@ def bot_mention():
         bot = result.get("result", {})
         return f'<a href="https://t.me/{bot.get("username", "")}">{bot.get("first_name", "JoinBot")}</a>'
     return "JoinBot"
+
 
 def render_text(value, user=None, chat=None):
     import html
@@ -101,6 +125,7 @@ def render_text(value, user=None, chat=None):
     return (str(value or "").replace("{mention}", mention)
             .replace("{chat}", chat_name).replace("{bot_mention}", bot_mention()))
 
+
 def save_message(kind, message):
     if not mongo_ready:
         return False
@@ -109,7 +134,7 @@ def save_message(kind, message):
         photos = message.get("photo") or []
         item = photos[-1] if photos else {}
     record = {
-        "_id": "start_message" if pending.get(int(message["from"]["id"])) == "start" else "join_message",
+        "_id": "start_message" if pending_setup.get(int(message["from"]["id"])) == "start" else "join_message",
         "kind": kind,
         "text": message.get("text"),
         "caption": message.get("caption"),
@@ -127,6 +152,7 @@ def save_message(kind, message):
     except Exception:
         log.exception("Could not save message")
         return False
+
 
 def send_saved(record, destination, user=None, chat=None):
     if not record:
@@ -151,18 +177,65 @@ def send_saved(record, destination, user=None, chat=None):
         payload.update({"caption": render_text(record["caption"], user, chat), "parse_mode": "HTML"})
     return tg(method, payload)
 
+
 def is_admin(user_id):
     return int(user_id or 0) in ADMIN_IDS
+
+
+def broadcast_message(source_chat_id, source_message_id):
+    """Copy the exact source Telegram message; broadcast payload is never persisted."""
+    if not mongo_ready:
+        return 0, 0
+    sent = failed = 0
+    user_ids = [doc["_id"] for doc in db.users.find({}, {"_id": 1})]
+    for user_id in user_ids:
+        result = tg("copyMessage", {
+            "chat_id": int(user_id),
+            "from_chat_id": int(source_chat_id),
+            "message_id": int(source_message_id),
+        }, timeout=20)
+        if result.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+            description = str(result.get("description", ""))
+            if "bot was blocked" in description.lower() or "user is deactivated" in description.lower():
+                try:
+                    db.users.delete_one({"_id": int(user_id)})
+                except Exception:
+                    log.exception("Could not remove unreachable user ID")
+            log.warning("Broadcast copy failed for user_id=%s: %s", user_id, description)
+            parameters = result.get("parameters") or {}
+            retry_after = parameters.get("retry_after")
+            if retry_after:
+                time.sleep(min(int(retry_after), 30))
+                retry = tg("copyMessage", {
+                    "chat_id": int(user_id),
+                    "from_chat_id": int(source_chat_id),
+                    "message_id": int(source_message_id),
+                }, timeout=20)
+                if retry.get("ok"):
+                    sent += 1
+                    failed -= 1
+        # Keep within Telegram's practical per-chat broadcast throughput.
+        time.sleep(0.05)
+    inc("broadcasts")
+    inc("broadcast_delivered", sent)
+    inc("broadcast_failed", failed)
+    return sent, failed
+
 
 def handle_message(message):
     chat = message.get("chat") or {}
     user = message.get("from") or {}
     uid = int(user.get("id") or 0)
     chat_id = int(chat.get("id") or 0)
-    if chat.get("type") != "private":
+    if chat.get("type") != "private" or not uid:
         return
+    remember_user_id(uid)
     text = str(message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+
     if command == "/start":
         saved = db.settings.find_one({"_id": "start_message"}) if mongo_ready else None
         if saved:
@@ -175,55 +248,104 @@ def handle_message(message):
             tg("sendMessage", {"chat_id": chat_id, "text": welcome, "parse_mode": "HTML"})
         inc("starts")
         return
+
     if not is_admin(uid):
         return
-    if command in ("/setstart", "/joinmessage"):
-        pending[uid] = "start" if command == "/setstart" else "join"
-        label = "start message" if command == "/setstart" else "join message"
-        tg("sendMessage", {"chat_id": chat_id, "text": f"Send the {label} now. Text or media is supported. /cancel to stop."})
+
+    if command == "/broadcast":
+        pending_broadcast.add(uid)
+        pending_setup.pop(uid, None)
+        tg("sendMessage", {
+            "chat_id": chat_id,
+            "text": "✦ <b>Broadcast mode</b>\n\n<i>Ab apna message, photo, video, GIF, document ya buttons wala message bhejiye. Main usi original message ko copy karke sabhi saved users ko bhejunga.</i>\n\n<i>Cancel karne ke liye /cancel bhejein.</i>",
+            "parse_mode": "HTML",
+        })
         return
+
     if command == "/cancel":
-        pending.pop(uid, None)
-        tg("sendMessage", {"chat_id": chat_id, "text": "Cancelled. No changes were made."})
+        pending_setup.pop(uid, None)
+        was_broadcast = uid in pending_broadcast
+        pending_broadcast.discard(uid)
+        tg("sendMessage", {
+            "chat_id": chat_id,
+            "text": "Broadcast cancelled." if was_broadcast else "Cancelled. No changes were made.",
+        })
         return
-    if command == "/default":
-        if mongo_ready:
-            db.settings.delete_one({"_id": "start_message"})
-        pending.pop(uid, None)
-        tg("sendMessage", {"chat_id": chat_id, "text": "Default /start message restored."})
-        return
-    if command == "/empty":
-        if mongo_ready:
-            db.settings.delete_one({"_id": "join_message"})
-        pending.pop(uid, None)
-        tg("sendMessage", {"chat_id": chat_id, "text": "Saved join message disabled."})
-        return
-    if command == "/stats":
-        stats = db.stats.find_one({"_id": "global"}) if mongo_ready else {}
-        uptime = max(0, int(time.time() - started_at))
-        hours, rem = divmod(uptime, 3600)
+
+    if uid in pending_broadcast:
+        if command:
+            tg("sendMessage", {"chat_id": chat_id, "text": "Please send the message to broadcast, or /cancel."})
+            return
+        pending_broadcast.discard(uid)
+        tg("sendMessage", {"chat_id": chat_id, "text": "Broadcast started. This may take a little time."})
+        sent, failed = broadcast_message(chat_id, int(message.get("message_id") or 0))
         tg("sendMessage", {
             "chat_id": chat_id,
             "parse_mode": "HTML",
-            "text": ("✦ <b>JOINBOT LIVE STATS</b>\n\n"
-                     f"🗄️ Database: {'🟢 Connected' if mongo_ready else '🔴 Offline'}\n"
-                     f"📥 Requests: <b>{(stats or {}).get('requests', 0)}</b>\n"
-                     f"✅ Approved: <b>{(stats or {}).get('approved', 0)}</b>\n"
-                     f"❌ Failed: <b>{(stats or {}).get('failed', 0)}</b>\n"
-                     f"✉️ /start uses: <b>{(stats or {}).get('starts', 0)}</b>\n"
-                     f"⏱ Uptime: <b>{hours}h {rem // 60}m</b>")
+            "text": f"✦ <b>Broadcast finished</b>\n\n<i>Delivered:</i> <b>{sent}</b>\n<i>Failed:</i> <b>{failed}</b>",
         })
         return
-    if uid in pending:
+
+    if command in ("/setstart", "/joinmessage"):
+        pending_setup[uid] = "start" if command == "/setstart" else "join"
+        label = "start message" if command == "/setstart" else "join message"
+        tg("sendMessage", {"chat_id": chat_id, "text": f"Send the {label} now. Text or media is supported. /cancel to stop."})
+        return
+
+    if command == "/default":
+        if mongo_ready:
+            db.settings.delete_one({"_id": "start_message"})
+        pending_setup.pop(uid, None)
+        tg("sendMessage", {"chat_id": chat_id, "text": "Default /start message restored."})
+        return
+
+    if command == "/empty":
+        if mongo_ready:
+            db.settings.delete_one({"_id": "join_message"})
+        pending_setup.pop(uid, None)
+        tg("sendMessage", {"chat_id": chat_id, "text": "Saved join message disabled."})
+        return
+
+    if command == "/stats":
+        stats = db.stats.find_one({"_id": "global"}) if mongo_ready else {}
+        users_count = db.users.count_documents({}) if mongo_ready else 0
+        uptime = max(0, int(time.time() - started_at))
+        days, rem = divmod(uptime, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        tg("sendMessage", {
+            "chat_id": chat_id,
+            "parse_mode": "HTML",
+            "text": (
+                "✦ <b>JOINBOT · STATISTICS</b> ✦\n"
+                "<i>━━━━━━━━━━━━━━━━━━</i>\n\n"
+                "<i>System overview</i>\n"
+                f"🗄️ <i>Database:</i> <b>{'🟢 Connected' if mongo_ready else '🔴 Offline'}</b>\n"
+                f"👥 <i>Saved user IDs:</i> <b>{users_count:,}</b>\n"
+                f"⏱ <i>Uptime:</i> <b>{days}d {hours}h {minutes}m</b>\n\n"
+                "<i>Join requests</i>\n"
+                f"📥 <i>Total requests:</i> <b>{(stats or {}).get('requests', 0):,}</b>\n"
+                f"✅ <i>Approved:</i> <b>{(stats or {}).get('approved', 0):,}</b>\n"
+                f"⚠️ <i>Failed:</i> <b>{(stats or {}).get('failed', 0):,}</b>\n\n"
+                "<i>Bot activity</i>\n"
+                f"✉️ <i>Starts:</i> <b>{(stats or {}).get('starts', 0):,}</b>\n"
+                f"📢 <i>Broadcasts:</i> <b>{(stats or {}).get('broadcasts', 0):,}</b>\n"
+                "<i>━━━━━━━━━━━━━━━━━━</i>"
+            ),
+        })
+        return
+
+    if uid in pending_setup:
         kind = next((k for k in MEDIA_FIELDS if message.get(k)), "text" if message.get("text") is not None else None)
         if not kind:
             tg("sendMessage", {"chat_id": chat_id, "text": "Please send text or supported media, or /cancel."})
             return
         if save_message(kind, message):
-            pending.pop(uid, None)
+            pending_setup.pop(uid, None)
             tg("sendMessage", {"chat_id": chat_id, "text": "Saved successfully in MongoDB."})
         else:
             tg("sendMessage", {"chat_id": chat_id, "text": "Could not save; check MongoDB connection."})
+
 
 def handle_join(update):
     join = update.get("chat_join_request") or {}
@@ -247,77 +369,30 @@ def handle_join(update):
     if saved and user_chat_id:
         send_saved(saved, user_chat_id, user, chat)
 
+
 def process_update(update):
     if update.get("chat_join_request"):
         handle_join(update)
     elif update.get("message"):
         handle_message(update["message"])
 
-def acquire_lease():
-    if not mongo_ready:
-        return False
-    now = datetime.utcnow()
-    expiry = now + timedelta(seconds=75)
-    try:
-        doc = db.settings.find_one_and_update(
-            {"_id": "poller_lease", "$or": [{"expires_at": {"$lte": now}}, {"owner": poller_owner}]},
-            {"$set": {"owner": poller_owner, "expires_at": expiry}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if doc:
-            return doc.get("owner") == poller_owner
-        db.settings.insert_one({"_id": "poller_lease", "owner": poller_owner, "expires_at": expiry})
-        return True
-    except Exception as exc:
-        if getattr(exc, "code", None) == 11000:
-            return False
-        log.exception("Polling lease error")
-        return False
 
-def poll_loop():
-    global offset
-    while not acquire_lease():
-        time.sleep(5)
-    tg("deleteWebhook", {"drop_pending_updates": False})
-    last_renewal = 0
-    log.info("Telegram polling started")
-    while True:
-        try:
-            if time.monotonic() - last_renewal >= 15:
-                updated = db.settings.update_one(
-                    {"_id": "poller_lease", "owner": poller_owner},
-                    {"$set": {"expires_at": datetime.utcnow() + timedelta(seconds=75)}},
-                )
-                if not updated.matched_count:
-                    log.error("Lost MongoDB polling lease; stopping")
-                    return
-                last_renewal = time.monotonic()
-            result = tg("getUpdates", {
-                "offset": offset, "timeout": 25,
-                "allowed_updates": ["message", "chat_join_request"],
-            }, timeout=35)
-            if not result.get("ok"):
-                log.error("getUpdates failed: %s", result.get("description"))
-                time.sleep(5)
-                continue
-            for update in result.get("result") or []:
-                offset = max(offset, int(update.get("update_id", 0)) + 1)
-                try:
-                    process_update(update)
-                except Exception:
-                    log.exception("Update processing failed")
-        except Exception:
-            log.exception("Polling loop crashed")
-            time.sleep(3)
+@app.post(f"/telegram/{WEBHOOK_PATH}")
+def telegram_webhook():
+    supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
+        return jsonify({"ok": False}), 403
+    update = request.get_json(silent=True) or {}
+    try:
+        process_update(update)
+    except Exception:
+        log.exception("Webhook update processing failed")
+    return jsonify({"ok": True})
+
 
 def start_bot():
-    global poller_started
-    with poller_lock:
-        if poller_started:
-            return
-        poller_started = True
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN is missing; bot polling disabled")
+        log.error("BOT_TOKEN is missing; bot webhook disabled")
         return
     if not ADMIN_IDS:
         log.warning("No admin IDs configured; admin commands will be unavailable")
@@ -330,12 +405,27 @@ def start_bot():
                 {"command": "default", "description": "Restore welcome message"},
                 {"command": "joinmessage", "description": "Set message after approval"},
                 {"command": "empty", "description": "Disable join message"},
+                {"command": "broadcast", "description": "Broadcast a copied message"},
                 {"command": "stats", "description": "View bot statistics"},
-                {"command": "cancel", "description": "Cancel setup"},
+                {"command": "cancel", "description": "Cancel setup or broadcast"},
             ],
             "scope": {"type": "chat", "chat_id": admin_id},
         })
-    threading.Thread(target=poll_loop, daemon=True, name="telegram-poller").start()
+    if not PUBLIC_URL:
+        log.error("RENDER_EXTERNAL_URL is missing; cannot configure Telegram webhook")
+        return
+    webhook_url = f"{PUBLIC_URL}/telegram/{WEBHOOK_PATH}"
+    result = tg("setWebhook", {
+        "url": webhook_url,
+        "secret_token": WEBHOOK_SECRET,
+        "allowed_updates": ["message", "chat_join_request"],
+        "drop_pending_updates": False,
+    })
+    if result.get("ok"):
+        log.info("Telegram webhook configured; background polling is disabled")
+    else:
+        log.error("Telegram webhook setup failed: %s", result.get("description"))
+
 
 @app.get("/")
 @app.get("/health")
@@ -347,7 +437,11 @@ def health():
         "database_connected": mongo_ready,
         "admin_configured": bool(ADMIN_IDS),
         "auto_approval": True,
+        "update_mode": "webhook",
+        "background_poller": False,
+        "user_id_retention_days": 365,
     })
+
 
 if __name__ == "__main__":
     start_bot()
