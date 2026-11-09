@@ -4,6 +4,7 @@ import uuid
 import hashlib
 import hmac
 import logging
+import threading
 from datetime import datetime, timedelta
 
 import requests
@@ -49,6 +50,8 @@ except Exception:
 started_at = time.time()
 pending_setup = {}
 pending_broadcast = set()
+active_chat_actions = {}
+active_chat_actions_lock = threading.Lock()
 MEDIA_FIELDS = ("photo", "video", "document", "animation", "audio", "voice", "video_note", "sticker")
 SEND_METHODS = {
     "photo": ("sendPhoto", "photo"),
@@ -73,7 +76,18 @@ def tg(method, payload=None, timeout=30):
             json=payload or {},
             timeout=timeout,
         )
-        return response.json()
+        result = response.json()
+        # Telegram clears chat actions when the bot sends a message/media reply.
+        if result.get("ok") and method in {
+            "sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAnimation",
+            "sendAudio", "sendVoice", "sendVideoNote", "sendSticker", "copyMessage",
+        }:
+            chat_id = (payload or {}).get("chat_id")
+            with active_chat_actions_lock:
+                stop_event = active_chat_actions.get(int(chat_id)) if chat_id is not None else None
+            if stop_event:
+                stop_event.set()
+        return result
     except Exception:
         log.exception("Telegram API call failed: %s", method)
         return {"ok": False, "description": "Telegram API request failed"}
@@ -90,6 +104,31 @@ def send_owner_action(owner_chat_id, action="typing"):
     if action not in allowed:
         action = "typing"
     return tg("sendChatAction", {"chat_id": int(owner_chat_id), "action": action}, timeout=8)
+
+
+def start_chat_action(chat_id, action="typing"):
+    """Keep Telegram's native status visible until the bot's reply is sent."""
+    chat_id = int(chat_id)
+    stop_event = threading.Event()
+    with active_chat_actions_lock:
+        previous = active_chat_actions.get(chat_id)
+        if previous:
+            previous.set()
+        active_chat_actions[chat_id] = stop_event
+
+    def refresh():
+        try:
+            send_owner_action(chat_id, action)
+            # Telegram chat actions expire after about five seconds; refresh
+            # every four seconds until tg() observes the outgoing reply.
+            while not stop_event.wait(4):
+                send_owner_action(chat_id, action)
+        finally:
+            with active_chat_actions_lock:
+                if active_chat_actions.get(chat_id) is stop_event:
+                    active_chat_actions.pop(chat_id, None)
+
+    threading.Thread(target=refresh, daemon=True).start()
 
 
 def action_for_message(message):
@@ -279,7 +318,7 @@ def handle_message(message):
         return
     # Show the matching native Telegram status immediately when an update arrives.
     # Telegram clears it as soon as the bot sends its reply (otherwise it expires in ~5s).
-    send_owner_action(chat_id, action_for_message(message))
+    start_chat_action(chat_id, action_for_message(message))
     text = str(message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
 
@@ -432,7 +471,7 @@ def handle_join(update):
     saved = db.settings.find_one({"_id": "join_message"}) if mongo_ready else None
     user_chat_id = int(join.get("user_chat_id") or 0)
     if saved and user_chat_id:
-        send_owner_action(user_chat_id, "typing")
+        start_chat_action(user_chat_id, "typing")
         send_saved(saved, user_chat_id, user, chat)
 
 
