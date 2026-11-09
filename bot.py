@@ -182,18 +182,21 @@ def is_admin(user_id):
     return int(user_id or 0) in ADMIN_IDS
 
 
-def broadcast_message(source_chat_id, source_message_id):
+def broadcast_message(source_chat_id, source_message_id, reply_markup=None):
     """Copy the exact source Telegram message; broadcast payload is never persisted."""
     if not mongo_ready:
         return 0, 0
     sent = failed = 0
     user_ids = [doc["_id"] for doc in db.users.find({}, {"_id": 1})]
     for user_id in user_ids:
-        result = tg("copyMessage", {
+        payload = {
             "chat_id": int(user_id),
             "from_chat_id": int(source_chat_id),
             "message_id": int(source_message_id),
-        }, timeout=20)
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        result = tg("copyMessage", payload, timeout=20)
         if result.get("ok"):
             sent += 1
         else:
@@ -209,11 +212,7 @@ def broadcast_message(source_chat_id, source_message_id):
             retry_after = parameters.get("retry_after")
             if retry_after:
                 time.sleep(min(int(retry_after), 30))
-                retry = tg("copyMessage", {
-                    "chat_id": int(user_id),
-                    "from_chat_id": int(source_chat_id),
-                    "message_id": int(source_message_id),
-                }, timeout=20)
+                retry = tg("copyMessage", payload, timeout=20)
                 if retry.get("ok"):
                     sent += 1
                     failed -= 1
@@ -278,7 +277,11 @@ def handle_message(message):
             return
         pending_broadcast.discard(uid)
         tg("sendMessage", {"chat_id": chat_id, "text": "Broadcast started. This may take a little time."})
-        sent, failed = broadcast_message(chat_id, int(message.get("message_id") or 0))
+        sent, failed = broadcast_message(
+            chat_id,
+            int(message.get("message_id") or 0),
+            message.get("reply_markup"),
+        )
         tg("sendMessage", {
             "chat_id": chat_id,
             "parse_mode": "HTML",
